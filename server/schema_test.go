@@ -8,7 +8,6 @@ import (
 	"github.com/spf13/afero"
 	"github.com/spf13/viper"
 
-	"context"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -59,8 +58,10 @@ func TestRenderOneQuery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Invalid RawMessage: %s", err)
 	}
-	if r := em.To; !cmp.Equal(r, []string{"ex@example.org"}) {
-		t.Errorf("Invalid email.To: %+v", r)
+	// go-mail formats email addresses with angle brackets when no display name is provided
+	expectedTo := []string{"<ex@example.org>"}
+	if r := em.To; !cmp.Equal(r, expectedTo) {
+		t.Errorf("Invalid email.To: %+v, expected: %+v", r, expectedTo)
 	}
 	if s := string(em.HTML); s != resp.RenderOne.HTML {
 		t.Errorf("Invalid RawMessage HTML: %s", s)
@@ -114,7 +115,7 @@ func issueGraphQLQuery(cfg *config.AConfig, query string) *graphql.Response {
 
 func issueGraphQL(cfg *config.AConfig, query string, vars map[string]interface{}) *graphql.Response {
 	schema := graphql.MustParseSchema(schemaText, &Resolver{cfg: cfg})
-	return schema.Exec(context.TODO(), query, "", vars)
+	return schema.Exec(cfg.Context, query, "", vars)
 }
 
 func newTestConfigAndFs(t *testing.T) (*config.AConfig, *config.Fs) {
@@ -126,7 +127,7 @@ func newTestConfigAndFs(t *testing.T) (*config.AConfig, *config.Fs) {
 
 	// Write and load fake configuration
 	afero.WriteFile(fs, "/config.toml", []byte(""), 0644)
-	cfg, err := config.LoadConfigFs(fs)
+	cfg, err := config.LoadConfigFs(t.Context(), fs)
 	if err != nil {
 		t.Fatal(err)
 	}

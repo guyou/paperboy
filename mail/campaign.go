@@ -2,6 +2,7 @@ package mail
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	html "html/template"
 	"io"
@@ -9,13 +10,13 @@ import (
 	"text/template"
 
 	"github.com/ghodss/yaml"
-	"github.com/go-gomail/gomail"
 	"github.com/jtacoma/uritemplates"
 	"github.com/microcosm-cc/bluemonday"
 	"github.com/rykov/paperboy/config"
 	"github.com/rykov/paperboy/parser"
 	"github.com/spf13/afero"
 	"github.com/spf13/cast"
+	"github.com/wneessen/go-mail"
 
 	"github.com/charmbracelet/glamour"
 	"github.com/charmbracelet/glamour/styles"
@@ -27,8 +28,8 @@ import (
 // Shared empty parameters
 var emptyParams = map[string]interface{}{}
 
-// Like "User-Agent"
-const xMailer = "paperboy/0.1.0 (https://paperboy.email)"
+// For "X-Mailer" header (ala "User-Agent" for browser)
+const xMailer = "paperboy/%s (https://paperboy.email)"
 
 // Context for template rendering
 type tmplContext struct {
@@ -50,15 +51,16 @@ type Campaign struct {
 	unsubscribeURLTemplate *uritemplates.UriTemplate
 
 	// Configuration for everything else
-	Config *config.AConfig
+	MsgOpts []mail.MsgOption
+	Config  *config.AConfig
 }
 
-func (c *Campaign) MessageFor(i int) (*gomail.Message, error) {
-	m := gomail.NewMessage()
+func (c *Campaign) MessageFor(i int) (*mail.Msg, error) {
+	m := mail.NewMsg(c.MsgOpts...)
 	return m, c.renderMessage(m, i)
 }
 
-func (c *Campaign) renderMessage(m *gomail.Message, i int) error {
+func (c *Campaign) renderMessage(m *mail.Msg, i int) error {
 	var content bytes.Buffer
 	appFs := c.Config.AppFs
 
@@ -94,17 +96,54 @@ func (c *Campaign) renderMessage(m *gomail.Message, i int) error {
 		return err
 	}
 
-	toEmail := cast.ToString(ctx.Recipient.Email)
-	toName := cast.ToString(ctx.Recipient.Name)
+	// Reset and populate header
+	m.Reset() // Return to NewMsg state
+	errT := addMessageRecipient(m, ctx)
+	errF := m.From(cast.ToString(ctx.Campaign.From))
+	m.Subject(cast.ToString(ctx.Subject))
+	m.SetDate()
 
-	m.Reset() // Return to NewMessage state
-	m.SetAddressHeader("To", toEmail, toName)
-	m.SetHeader("Subject", cast.ToString(ctx.Subject))
-	m.SetHeader("From", cast.ToString(ctx.Campaign.From))
-	m.SetHeader("X-Mailer", xMailer)
-	m.SetBody("text/plain", plainBody)
-	m.AddAlternative("text/html", htmlBody)
-	return nil
+	// Populate mailer name & version
+	xm := fmt.Sprintf(xMailer, c.Config.Build.Version)
+	m.SetGenHeader("X-Mailer", xm)
+
+	// Populate plain & HTML body
+	m.SetBodyString(mail.TypeTextPlain, plainBody)
+	m.AddAlternativeString(mail.TypeTextHTML, htmlBody)
+
+	// Include attachments by path within AppFs
+	errs, fs := []error{}, afero.NewIOFS(c.Config.AppFs)
+	for _, a := range c.EmailMeta.attachments {
+		path := c.Config.AppFs.AssetPath(a) // ./assets
+		if err := m.AttachFromIOFS(path, fs); err != nil {
+			errs = append(errs, err)
+		}
+	}
+
+	errs = append(errs, errT, errF)
+	return errors.Join(errs...)
+}
+
+// Populates default recipient or renders "To" campaign template
+func addMessageRecipient(m *mail.Msg, ctx *tmplContext) error {
+	toTmpl := ctx.Campaign.to
+	if toTmpl == "" {
+		toEmail := cast.ToString(ctx.Recipient.Email)
+		toName := cast.ToString(ctx.Recipient.Name)
+		return m.AddToFormat(toName, toEmail)
+	}
+
+	tmpl, err := template.New("to").Parse(toTmpl)
+	if err != nil {
+		return err
+	}
+
+	to, err := executeTemplate(nil, tmpl, ctx)
+	if err != nil {
+		return err
+	}
+
+	return m.AddTo(to)
 }
 
 // Create template context for messages and layouts
@@ -161,6 +200,8 @@ func LoadContent(cfg *config.AConfig, tmplID string) (*Campaign, error) {
 	if meta, err := email.Metadata(); err == nil && meta != nil {
 		metadata, _ := meta.(map[string]interface{})
 		fMeta = newCampaign(cfg, metadata)
+	} else if err != nil {
+		return nil, fmt.Errorf("failed to decode campain's frontmatter: %w", err)
 	} else { // Just defaults
 		fMeta = newCampaign(cfg, emptyParams)
 	}
@@ -186,12 +227,20 @@ func LoadContent(cfg *config.AConfig, tmplID string) (*Campaign, error) {
 		}
 	}
 
+	// Prepare []mail.MsgOption
+	opts, err := msgOptions(cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	// Create campaign
 	return &Campaign{
 		EmailMeta: &fMeta,
 		Email:     email,
 
-		ID:     id,
-		Config: cfg,
+		ID:      id,
+		Config:  cfg,
+		MsgOpts: opts,
 
 		unsubscribeURLTemplate: unsubscribe,
 		bodyTemplate:           tmpl,
@@ -346,4 +395,18 @@ func executeTemplate(body []byte, tmpl Template, ctx *tmplContext) (string, erro
 	err := tmpl.Execute(&out, ctx)
 	ctx.Content = html.HTML("")
 	return out.String(), err
+}
+
+func msgOptions(cfg *config.AConfig) ([]mail.MsgOption, error) {
+	var opts = []mail.MsgOption{}
+
+	if len(cfg.DKIM) > 0 {
+		mw, err := DKIMMiddleware(cfg)
+		if err != nil {
+			return nil, err
+		}
+		opts = append(opts, mail.WithMiddleware(mw))
+	}
+
+	return opts, nil
 }

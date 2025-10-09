@@ -1,0 +1,778 @@
+package mail
+
+import (
+	"bytes"
+	"strings"
+	"testing"
+
+	"github.com/google/go-cmp/cmp"
+	"github.com/rykov/paperboy/config"
+	"github.com/spf13/afero"
+)
+
+func TestCampaignEndToEnd(t *testing.T) {
+	// Setup virtual filesystem
+	memFs := afero.NewMemMapFs()
+
+	// Create basic directory structure
+	memFs.MkdirAll("content", 0755)
+	memFs.MkdirAll("lists", 0755)
+	memFs.MkdirAll("layouts", 0755)
+
+	// Create a basic email template with frontmatter
+	emailContent := `---
+subject: "Test Newsletter"
+from: "test@example.com"
+---
+
+# Hello {{ .Recipient.Name }}!
+
+Welcome to our newsletter. This is a test campaign.
+
+Best regards,
+The Team`
+
+	afero.WriteFile(memFs, "content/newsletter.md", []byte(emailContent), 0644)
+
+	// Create a basic recipient list
+	recipientList := `- name: "John Doe"
+  email: "john@example.com"
+- name: "Jane Smith"
+  email: "jane@example.com"`
+
+	afero.WriteFile(memFs, "lists/subscribers.yaml", []byte(recipientList), 0644)
+
+	// Create default layouts
+	htmlLayout := `<html>
+<head><title>{{ .Subject }}</title></head>
+<body>
+{{ .Content }}
+<hr>
+<p><a href="{{ .UnsubscribeURL }}">Unsubscribe</a></p>
+<p>{{ .Address }}</p>
+</body>
+</html>`
+
+	textLayout := `{{ .Content }}
+
+---
+Unsubscribe: {{ .UnsubscribeURL }}
+{{ .Address }}`
+
+	afero.WriteFile(memFs, "layouts/_default.html", []byte(htmlLayout), 0644)
+	afero.WriteFile(memFs, "layouts/_default.text", []byte(textLayout), 0644)
+
+	// Load configuration using the new config system
+	cfg, err := config.LoadConfigFs(t.Context(), memFs)
+	if err != nil {
+		t.Fatalf("Failed to load config: %v", err)
+	}
+
+	// Configure for dry-run testing
+	cfg.DryRun = true
+	cfg.From = "newsletter@example.com"
+	cfg.Address = "123 Main St, Anytown, USA"
+	cfg.UnsubscribeURL = "https://example.com/unsubscribe?email={recipient.email}"
+	cfg.ContentDir = "content"
+	cfg.ListDir = "lists"
+	cfg.LayoutDir = "layouts"
+	cfg.Workers = 1
+	cfg.SendRate = 0
+
+	// Load campaign using new API
+	campaign, err := LoadCampaign(cfg, "newsletter", "subscribers")
+	if err != nil {
+		t.Fatalf("Failed to load campaign: %v", err)
+	}
+
+	// Verify campaign loaded correctly
+	if campaign.ID != "newsletter" {
+		t.Errorf("Expected campaign ID 'newsletter', got '%s'", campaign.ID)
+	}
+
+	if len(campaign.Recipients) != 2 {
+		t.Errorf("Expected 2 recipients, got %d", len(campaign.Recipients))
+	}
+
+	if campaign.EmailMeta.Subject() != "Test Newsletter" {
+		t.Errorf("Expected subject 'Test Newsletter', got '%s'", campaign.EmailMeta.Subject())
+	}
+
+	if campaign.EmailMeta.From != "test@example.com" {
+		t.Errorf("Expected from 'test@example.com', got '%s'", campaign.EmailMeta.From)
+	}
+
+	// Test message generation for first recipient
+	message, err := campaign.MessageFor(0)
+	if err != nil {
+		t.Fatalf("Failed to generate message: %v", err)
+	}
+
+	// Verify message content by checking the raw message
+	var buf bytes.Buffer
+	if _, err := message.WriteTo(&buf); err != nil {
+		t.Fatalf("Failed to write message: %v", err)
+	}
+
+	msgContent := buf.String()
+	t.Logf("Message content: %s", msgContent) // Debug output
+	if !strings.Contains(msgContent, "john@example.com") {
+		t.Errorf("Expected email john@example.com in message content")
+	}
+
+	if !strings.Contains(msgContent, "Test Newsletter") {
+		t.Errorf("Expected Subject 'Test Newsletter' in message content")
+	}
+
+	if !strings.Contains(msgContent, "test@example.com") {
+		t.Errorf("Expected From email 'test@example.com' in message content")
+	}
+
+	// Test message generation for second recipient
+	message2, err := campaign.MessageFor(1)
+	if err != nil {
+		t.Fatalf("Failed to generate message for second recipient: %v", err)
+	}
+
+	var buf2 bytes.Buffer
+	if _, err := message2.WriteTo(&buf2); err != nil {
+		t.Fatalf("Failed to write message2: %v", err)
+	}
+
+	msgContent2 := buf2.String()
+	if !strings.Contains(msgContent2, "jane@example.com") {
+		t.Errorf("Expected email jane@example.com in message2 content")
+	}
+
+	// Test full campaign send (dry-run) using new API
+	err = SendCampaign(cfg, campaign)
+	if err != nil {
+		t.Fatalf("Failed to send campaign: %v", err)
+	}
+
+	t.Log("Campaign test completed successfully with dry-run sender")
+}
+
+func TestToTemplateEmpty(t *testing.T) {
+	memFs := afero.NewMemMapFs()
+	memFs.MkdirAll("content", 0755)
+
+	// Email template without "to" field in frontmatter
+	emailContent := `---
+subject: "Test Email"
+from: "sender@example.com"
+---
+
+Hello {{ .Recipient.Name }}!`
+
+	afero.WriteFile(memFs, "content/test.md", []byte(emailContent), 0644)
+
+	cfg, err := config.LoadConfigFs(t.Context(), memFs)
+	if err != nil {
+		t.Fatalf("Failed to load config: %v", err)
+	}
+
+	campaign, err := LoadContent(cfg, "test")
+	if err != nil {
+		t.Fatalf("Failed to load campaign: %v", err)
+	}
+
+	// Add a test recipient
+	campaign.Recipients = []*ctxRecipient{
+		{
+			Email: "john@example.com",
+			Name:  "John Doe",
+		},
+	}
+
+	message, err := campaign.MessageFor(0)
+	if err != nil {
+		t.Fatalf("Failed to generate message: %v", err)
+	}
+
+	// Verify default To behavior (AddToFormat)
+	var buf bytes.Buffer
+	if _, err := message.WriteTo(&buf); err != nil {
+		t.Fatalf("Failed to write message: %v", err)
+	}
+
+	msgContent := buf.String()
+	if !strings.Contains(msgContent, "john@example.com") {
+		t.Error("Message should contain recipient email with default To behavior")
+	}
+	if !strings.Contains(msgContent, "John Doe") {
+		t.Error("Message should contain recipient name with default To behavior")
+	}
+}
+
+func TestToTemplateSuccess(t *testing.T) {
+	memFs := afero.NewMemMapFs()
+	memFs.MkdirAll("content", 0755)
+
+	// Email template with "to" template in frontmatter
+	emailContent := `---
+subject: "Test Email"
+from: "sender@example.com"
+to: "User {{ .Recipient.Name }} <{{ .Recipient.Email }}>"
+---
+
+Hello {{ .Recipient.Name }}!`
+
+	afero.WriteFile(memFs, "content/test.md", []byte(emailContent), 0644)
+
+	cfg, err := config.LoadConfigFs(t.Context(), memFs)
+	if err != nil {
+		t.Fatalf("Failed to load config: %v", err)
+	}
+
+	campaign, err := LoadContent(cfg, "test")
+	if err != nil {
+		t.Fatalf("Failed to load campaign: %v", err)
+	}
+
+	// Add a test recipient
+	campaign.Recipients = []*ctxRecipient{
+		{
+			Email: "jane@example.com",
+			Name:  "Jane Smith",
+		},
+	}
+
+	message, err := campaign.MessageFor(0)
+	if err != nil {
+		t.Fatalf("Failed to generate message: %v", err)
+	}
+
+	// Verify To template was rendered correctly
+	var buf bytes.Buffer
+	if _, err := message.WriteTo(&buf); err != nil {
+		t.Fatalf("Failed to write message: %v", err)
+	}
+
+	msgContent := buf.String()
+	// Should contain the rendered template format (go-mail formats with quotes)
+	expectedTo := `"User Jane Smith" <jane@example.com>`
+	if !strings.Contains(msgContent, expectedTo) {
+		t.Errorf("Message should contain rendered To template '%s', got: %s", expectedTo, msgContent)
+	}
+}
+
+func TestToTemplateInvalidSyntax(t *testing.T) {
+	memFs := afero.NewMemMapFs()
+	memFs.MkdirAll("content", 0755)
+
+	// Email template with invalid "to" template syntax
+	emailContent := `---
+subject: "Test Email"
+from: "sender@example.com"
+to: "{{ .Recipient.InvalidField"
+---
+
+Hello {{ .Recipient.Name }}!`
+
+	afero.WriteFile(memFs, "content/test.md", []byte(emailContent), 0644)
+
+	cfg, err := config.LoadConfigFs(t.Context(), memFs)
+	if err != nil {
+		t.Fatalf("Failed to load config: %v", err)
+	}
+
+	campaign, err := LoadContent(cfg, "test")
+	if err != nil {
+		t.Fatalf("Failed to load campaign: %v", err)
+	}
+
+	// Add a test recipient
+	campaign.Recipients = []*ctxRecipient{
+		{
+			Email: "test@example.com",
+			Name:  "Test User",
+		},
+	}
+
+	// Should fail when trying to generate message due to invalid template
+	_, err = campaign.MessageFor(0)
+	if err == nil {
+		t.Error("Expected error when using invalid To template syntax")
+	}
+
+	if !strings.Contains(err.Error(), "template") {
+		t.Errorf("Error should mention template parsing issue, got: %v", err)
+	}
+}
+
+func TestToTemplateRenderingError(t *testing.T) {
+	memFs := afero.NewMemMapFs()
+	memFs.MkdirAll("content", 0755)
+
+	// Email template with "to" template that references non-existent field
+	emailContent := `---
+subject: "Test Email"
+from: "sender@example.com"
+to: "{{ .NonExistentField.Email }}"
+---
+
+Hello {{ .Recipient.Name }}!`
+
+	afero.WriteFile(memFs, "content/test.md", []byte(emailContent), 0644)
+
+	cfg, err := config.LoadConfigFs(t.Context(), memFs)
+	if err != nil {
+		t.Fatalf("Failed to load config: %v", err)
+	}
+
+	campaign, err := LoadContent(cfg, "test")
+	if err != nil {
+		t.Fatalf("Failed to load campaign: %v", err)
+	}
+
+	// Add a test recipient
+	campaign.Recipients = []*ctxRecipient{
+		{
+			Email: "test@example.com",
+			Name:  "Test User",
+		},
+	}
+
+	// Should fail when trying to render the template due to missing field
+	_, err = campaign.MessageFor(0)
+	if err == nil {
+		t.Error("Expected error when To template references non-existent field")
+	}
+}
+
+func TestToTemplateInvalidEmailAddress(t *testing.T) {
+	memFs := afero.NewMemMapFs()
+	memFs.MkdirAll("content", 0755)
+
+	// Email template with "to" template that renders to an invalid email address
+	emailContent := `---
+subject: "Test Email"
+from: "sender@example.com"
+to: "{{ .Recipient.Name }} invalid-email-format"
+---
+
+Hello {{ .Recipient.Name }}!`
+
+	afero.WriteFile(memFs, "content/test.md", []byte(emailContent), 0644)
+
+	cfg, err := config.LoadConfigFs(t.Context(), memFs)
+	if err != nil {
+		t.Fatalf("Failed to load config: %v", err)
+	}
+
+	campaign, err := LoadContent(cfg, "test")
+	if err != nil {
+		t.Fatalf("Failed to load campaign: %v", err)
+	}
+
+	// Add a test recipient
+	campaign.Recipients = []*ctxRecipient{
+		{
+			Email: "test@example.com",
+			Name:  "Test User",
+		},
+	}
+
+	// Should fail when m.AddTo() tries to parse the invalid email address
+	_, err = campaign.MessageFor(0)
+	if err == nil {
+		t.Error("Expected error when To template renders invalid email address")
+	}
+
+	// The error should be related to email address parsing/validation
+	if !strings.Contains(err.Error(), "address") && !strings.Contains(err.Error(), "email") {
+		t.Errorf("Error should mention address/email validation issue, got: %v", err)
+	}
+}
+
+func TestLoadContentWithMalformedFrontmatter(t *testing.T) {
+	memFs := afero.NewMemMapFs()
+	memFs.MkdirAll("content", 0755)
+
+	// Email template with malformed YAML frontmatter
+	emailContent := `---
+subject: "Test Email"
+from: "sender@example.com"
+invalid_yaml: [unclosed array
+---
+
+Hello World!`
+
+	afero.WriteFile(memFs, "content/malformed.md", []byte(emailContent), 0644)
+
+	cfg, err := config.LoadConfigFs(t.Context(), memFs)
+	if err != nil {
+		t.Fatalf("Failed to load config: %v", err)
+	}
+
+	// Should fail when trying to parse malformed frontmatter
+	_, err = LoadContent(cfg, "malformed")
+	if err == nil {
+		t.Error("Expected error when parsing malformed frontmatter")
+	}
+
+	if !strings.Contains(err.Error(), "frontmatter") {
+		t.Errorf("Error should mention frontmatter parsing issue, got: %v", err)
+	}
+}
+
+func TestCampaignWithAttachments(t *testing.T) {
+	// Setup virtual filesystem
+	memFs := afero.NewMemMapFs()
+
+	// Create basic directory structure
+	memFs.MkdirAll("content", 0755)
+	memFs.MkdirAll("lists", 0755)
+	memFs.MkdirAll("layouts", 0755)
+	memFs.MkdirAll("assets", 0755)
+
+	// Create test attachment files in assets directory
+	afero.WriteFile(memFs, "assets/document.pdf", []byte("fake PDF content"), 0644)
+	afero.WriteFile(memFs, "assets/image.png", []byte("fake PNG content"), 0644)
+	afero.WriteFile(memFs, "assets/data.csv", []byte("name,email\nJohn,john@example.com"), 0644)
+
+	// Create email template with attachments
+	emailContent := `---
+subject: "Newsletter with Attachments"
+from: "test@example.com"
+attachments:
+  - "document.pdf"
+  - "image.png"
+---
+
+# Hello {{ .Recipient.Name }}!
+
+Please find the attached documents.
+
+Best regards,
+The Team`
+
+	afero.WriteFile(memFs, "content/newsletter.md", []byte(emailContent), 0644)
+
+	// Create a basic recipient list
+	recipientList := `- name: "John Doe"
+  email: "john@example.com"`
+
+	afero.WriteFile(memFs, "lists/subscribers.yaml", []byte(recipientList), 0644)
+
+	// Create default layouts
+	htmlLayout := `<html><body>{{ .Content }}</body></html>`
+	textLayout := `{{ .Content }}`
+
+	afero.WriteFile(memFs, "layouts/_default.html", []byte(htmlLayout), 0644)
+	afero.WriteFile(memFs, "layouts/_default.text", []byte(textLayout), 0644)
+
+	// Load configuration
+	cfg, err := config.LoadConfigFs(t.Context(), memFs)
+	if err != nil {
+		t.Fatalf("Failed to load config: %v", err)
+	}
+
+	cfg.DryRun = true
+	cfg.ContentDir = "content"
+	cfg.ListDir = "lists"
+	cfg.LayoutDir = "layouts"
+
+	// Load campaign
+	campaign, err := LoadCampaign(cfg, "newsletter", "subscribers")
+	if err != nil {
+		t.Fatalf("Failed to load campaign: %v", err)
+	}
+
+	// Verify attachments were parsed correctly
+	expectedAttachments := []string{"document.pdf", "image.png"}
+	if !cmp.Equal(campaign.EmailMeta.attachments, expectedAttachments) {
+		t.Errorf("Expected attachments %v, got %v", expectedAttachments, campaign.EmailMeta.attachments)
+	}
+
+	// Generate message for first recipient
+	message, err := campaign.MessageFor(0)
+	if err != nil {
+		t.Fatalf("Failed to generate message: %v", err)
+	}
+
+	// Verify message content includes attachment headers
+	var buf bytes.Buffer
+	if _, err := message.WriteTo(&buf); err != nil {
+		t.Fatalf("Failed to write message: %v", err)
+	}
+
+	msgContent := buf.String()
+
+	// Check for attachment-related headers/content
+	if !strings.Contains(msgContent, "Content-Disposition: attachment") {
+		t.Error("Message should contain attachment disposition headers")
+	}
+
+	if !strings.Contains(msgContent, "document.pdf") {
+		t.Error("Message should reference document.pdf attachment")
+	}
+
+	if !strings.Contains(msgContent, "image.png") {
+		t.Error("Message should reference image.png attachment")
+	}
+}
+
+func TestCampaignWithSingleAttachment(t *testing.T) {
+	// Setup virtual filesystem
+	memFs := afero.NewMemMapFs()
+	memFs.MkdirAll("content", 0755)
+	memFs.MkdirAll("assets", 0755)
+
+	// Create test attachment file
+	afero.WriteFile(memFs, "assets/report.pdf", []byte("fake PDF report"), 0644)
+
+	// Create email template with single attachment (string format)
+	emailContent := `---
+subject: "Report"
+from: "test@example.com"
+attachments: "report.pdf"
+---
+
+Please find the attached report.`
+
+	afero.WriteFile(memFs, "content/report.md", []byte(emailContent), 0644)
+
+	// Create layouts
+	afero.WriteFile(memFs, "layouts/_default.html", []byte("<html>{{ .Content }}</html>"), 0644)
+	afero.WriteFile(memFs, "layouts/_default.text", []byte("{{ .Content }}"), 0644)
+
+	cfg, err := config.LoadConfigFs(t.Context(), memFs)
+	if err != nil {
+		t.Fatalf("Failed to load config: %v", err)
+	}
+
+	cfg.DryRun = true
+	cfg.ContentDir = "content"
+	cfg.LayoutDir = "layouts"
+
+	// Load campaign content
+	campaign, err := LoadContent(cfg, "report")
+	if err != nil {
+		t.Fatalf("Failed to load campaign: %v", err)
+	}
+
+	// Verify single attachment was parsed as slice
+	expectedAttachments := []string{"report.pdf"}
+	if !cmp.Equal(campaign.EmailMeta.attachments, expectedAttachments) {
+		t.Errorf("Expected attachments %v, got %v", expectedAttachments, campaign.EmailMeta.attachments)
+	}
+
+	// Add a test recipient
+	campaign.Recipients = []*ctxRecipient{{Email: "test@example.com", Name: "Test User"}}
+
+	// Generate message
+	message, err := campaign.MessageFor(0)
+	if err != nil {
+		t.Fatalf("Failed to generate message: %v", err)
+	}
+
+	var buf bytes.Buffer
+	if _, err := message.WriteTo(&buf); err != nil {
+		t.Fatalf("Failed to write message: %v", err)
+	}
+
+	msgContent := buf.String()
+	if !strings.Contains(msgContent, "report.pdf") {
+		t.Error("Message should reference report.pdf attachment")
+	}
+}
+
+func TestCampaignWithMissingAttachment(t *testing.T) {
+	// Setup virtual filesystem
+	memFs := afero.NewMemMapFs()
+	memFs.MkdirAll("content", 0755)
+
+	// Create email template with non-existent attachment
+	emailContent := `---
+subject: "Missing Attachment Test"
+from: "test@example.com"
+attachments: "nonexistent-file.pdf"
+---
+
+This should fail due to missing attachment.`
+
+	afero.WriteFile(memFs, "content/test.md", []byte(emailContent), 0644)
+
+	// Create layouts
+	afero.WriteFile(memFs, "layouts/_default.html", []byte("<html>{{ .Content }}</html>"), 0644)
+	afero.WriteFile(memFs, "layouts/_default.text", []byte("{{ .Content }}"), 0644)
+
+	cfg, err := config.LoadConfigFs(t.Context(), memFs)
+	if err != nil {
+		t.Fatalf("Failed to load config: %v", err)
+	}
+
+	cfg.DryRun = true
+	cfg.ContentDir = "content"
+	cfg.LayoutDir = "layouts"
+
+	// Load campaign content
+	campaign, err := LoadContent(cfg, "test")
+	if err != nil {
+		t.Fatalf("Failed to load campaign: %v", err)
+	}
+
+	// Add a test recipient
+	campaign.Recipients = []*ctxRecipient{{Email: "test@example.com", Name: "Test User"}}
+
+	// Should fail when trying to attach non-existent file
+	_, err = campaign.MessageFor(0)
+	if err == nil {
+		t.Error("Expected error when trying to attach non-existent file")
+	}
+
+	if !strings.Contains(err.Error(), "file") && !strings.Contains(err.Error(), "attach") {
+		t.Errorf("Error should mention file/attachment issue, got: %v", err)
+	}
+}
+
+func TestCampaignWithNoAttachments(t *testing.T) {
+	// Setup virtual filesystem
+	memFs := afero.NewMemMapFs()
+	memFs.MkdirAll("content", 0755)
+
+	// Create email template without attachments
+	emailContent := `---
+subject: "No Attachments"
+from: "test@example.com"
+---
+
+Simple email without attachments.`
+
+	afero.WriteFile(memFs, "content/simple.md", []byte(emailContent), 0644)
+
+	// Create layouts
+	afero.WriteFile(memFs, "layouts/_default.html", []byte("<html>{{ .Content }}</html>"), 0644)
+	afero.WriteFile(memFs, "layouts/_default.text", []byte("{{ .Content }}"), 0644)
+
+	cfg, err := config.LoadConfigFs(t.Context(), memFs)
+	if err != nil {
+		t.Fatalf("Failed to load config: %v", err)
+	}
+
+	cfg.DryRun = true
+	cfg.ContentDir = "content"
+	cfg.LayoutDir = "layouts"
+
+	// Load campaign content
+	campaign, err := LoadContent(cfg, "simple")
+	if err != nil {
+		t.Fatalf("Failed to load campaign: %v", err)
+	}
+
+	// Verify no attachments
+	if campaign.EmailMeta.attachments != nil {
+		t.Errorf("Expected no attachments, got %v", campaign.EmailMeta.attachments)
+	}
+
+	// Add a test recipient
+	campaign.Recipients = []*ctxRecipient{{Email: "test@example.com", Name: "Test User"}}
+
+	// Generate message (should work fine without attachments)
+	message, err := campaign.MessageFor(0)
+	if err != nil {
+		t.Fatalf("Failed to generate message: %v", err)
+	}
+
+	var buf bytes.Buffer
+	if _, err := message.WriteTo(&buf); err != nil {
+		t.Fatalf("Failed to write message: %v", err)
+	}
+
+	msgContent := buf.String()
+	if strings.Contains(msgContent, "Content-Disposition: attachment") {
+		t.Error("Message should not contain attachment headers when no attachments")
+	}
+}
+
+func TestCampaignAttachmentPathTraversal(t *testing.T) {
+	// Setup virtual filesystem
+	memFs := afero.NewMemMapFs()
+	memFs.MkdirAll("content", 0755)
+	memFs.MkdirAll("assets", 0755)
+
+	// Create a file in assets directory
+	afero.WriteFile(memFs, "assets/document.pdf", []byte("safe content"), 0644)
+
+	// The actual security is provided by using AppFs which restricts access
+	emailContent := `---
+subject: "Path Traversal Test"
+from: "test@example.com"
+attachments: "document.pdf"
+---
+
+Testing safe attachment access.`
+
+	afero.WriteFile(memFs, "content/test.md", []byte(emailContent), 0644)
+
+	// Create layouts
+	afero.WriteFile(memFs, "layouts/_default.html", []byte("<html>{{ .Content }}</html>"), 0644)
+	afero.WriteFile(memFs, "layouts/_default.text", []byte("{{ .Content }}"), 0644)
+
+	cfg, err := config.LoadConfigFs(t.Context(), memFs)
+	if err != nil {
+		t.Fatalf("Failed to load config: %v", err)
+	}
+
+	cfg.DryRun = true
+	cfg.ContentDir = "content"
+	cfg.LayoutDir = "layouts"
+
+	// Load campaign content
+	campaign, err := LoadContent(cfg, "test")
+	if err != nil {
+		t.Fatalf("Failed to load campaign: %v", err)
+	}
+
+	// Add a test recipient
+	campaign.Recipients = []*ctxRecipient{{Email: "test@example.com", Name: "Test User"}}
+
+	// Should work for legitimate file within AppFs
+	message, err := campaign.MessageFor(0)
+	if err != nil {
+		t.Fatalf("Failed to generate message for legitimate attachment: %v", err)
+	}
+
+	var buf bytes.Buffer
+	if _, err := message.WriteTo(&buf); err != nil {
+		t.Fatalf("Failed to write message: %v", err)
+	}
+
+	msgContent := buf.String()
+	if !strings.Contains(msgContent, "document.pdf") {
+		t.Error("Message should reference legitimate attachment")
+	}
+}
+
+func TestLoadContentWithMalformedJSON(t *testing.T) {
+	memFs := afero.NewMemMapFs()
+	memFs.MkdirAll("content", 0755)
+
+	// Email template with malformed JSON frontmatter
+	emailContent := `{
+  "subject": "Test Email",
+  "from": "sender@example.com",
+  "invalid_json": {unclosed object
+}
+
+Hello World!`
+
+	afero.WriteFile(memFs, "content/malformed_json.md", []byte(emailContent), 0644)
+
+	cfg, err := config.LoadConfigFs(t.Context(), memFs)
+	if err != nil {
+		t.Fatalf("Failed to load config: %v", err)
+	}
+
+	// Should fail when trying to parse malformed JSON frontmatter
+	_, err = LoadContent(cfg, "malformed_json")
+	if err == nil {
+		t.Error("Expected error when parsing malformed JSON frontmatter")
+	}
+
+	if !strings.Contains(err.Error(), "frontmatter") {
+		t.Errorf("Error should mention frontmatter parsing issue, got: %v", err)
+	}
+}

@@ -33,6 +33,7 @@ type handler struct {
 func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if !strings.HasPrefix(r.Header.Get("Content-Type"), "multipart/form-data") {
 		h.Handler.ServeHTTP(w, r)
+		return
 	}
 
 	// Parse form to capture request & zip

@@ -2,22 +2,28 @@ package mail
 
 import (
 	"crypto/tls"
+	"errors"
 
 	"github.com/cenkalti/backoff/v5"
-	"github.com/go-gomail/gomail"
 	"github.com/rykov/paperboy/config"
+	"github.com/wneessen/go-mail"
 
 	"bytes"
 	"context"
 	"fmt"
-	"io"
 	"net/url"
 	"strconv"
 	"sync"
 	"time"
 )
 
-func LoadAndSendCampaign(ctx context.Context, cfg *config.AConfig, tmplFile, recipientFile string, filter string) error {
+// SendCloser interface for sending emails
+type SendCloser interface {
+	Send(msg ...*mail.Msg) error
+	Close() error
+}
+
+func LoadAndSendCampaign(cfg *config.AConfig, tmplFile, recipientFile string, filter string) error {
 	// Load up template and recipientswith frontmatter
 	c, err := LoadCampaign(cfg, tmplFile, recipientFile)
 	if err != nil {
@@ -37,25 +43,24 @@ func LoadAndSendCampaign(ctx context.Context, cfg *config.AConfig, tmplFile, rec
 		c.Recipients = filteredRecipients
 	}
 
-	return SendCampaign(ctx, cfg, c)
+	return SendCampaign(cfg, c)
 }
 
-func SendCampaign(ctx context.Context, cfg *config.AConfig, c *Campaign) error {
+func SendCampaign(cfg *config.AConfig, c *Campaign) error {
 	// Initialize deliverer
 	engine := &deliverer{
-		tasks:    make(chan *gomail.Message, 10),
+		tasks:    make(chan *mail.Msg, 10),
 		waiter:   &sync.WaitGroup{},
-		context:  ctx,
+		context:  cfg.Context,
 		campaign: c,
 	}
 
 	// Capture context cancellation for graceful exit
-	if done := ctx.Done(); done != nil {
-		go func() {
-			<-done
-			engine.close()
-		}()
-	}
+	done := cfg.Context.Done()
+	go func() {
+		<-done
+		engine.close()
+	}()
 
 	// Rate configuration
 	throttle, workers := time.Duration(0), cfg.Workers
@@ -68,7 +73,7 @@ func SendCampaign(ctx context.Context, cfg *config.AConfig, c *Campaign) error {
 	fmt.Printf("Sending an email every %s via %d workers\n", throttle, workers)
 	go func() {
 		for i := range c.Recipients {
-			m := gomail.NewMessage()
+			m := mail.NewMsg(c.MsgOpts...)
 			if err := c.renderMessage(m, i); err != nil {
 				fmt.Printf("Could not queue email: %s\n", err)
 				engine.close()
@@ -78,8 +83,7 @@ func SendCampaign(ctx context.Context, cfg *config.AConfig, c *Campaign) error {
 			// Gracefully handle exits and make sure we don't
 			// try to queue mails into a closed channel
 			if engine.stop {
-				// TODO: Dump a cursor that can be used to resume a campaign
-				fmt.Printf("Stopped queing before %s\n", m.GetHeader("To"))
+				fmt.Printf("Stopped queing before %+v\n", m.GetToString())
 				break
 			} else {
 				engine.tasks <- m
@@ -116,10 +120,13 @@ type deliverer struct {
 	campaign *Campaign
 	context  context.Context
 	waiter   *sync.WaitGroup
-	tasks    chan *gomail.Message
+	tasks    chan *mail.Msg
 
 	stop  bool
 	stopL sync.Mutex
+
+	// Go-Mail middleware
+	middleware []mail.Middleware
 }
 
 func (d *deliverer) close() {
@@ -158,8 +165,8 @@ func (d *deliverer) startWorker(id int) error {
 			if !more {
 				return
 			}
-			fmt.Printf("[%d] Sending %s to %s\n", id, c.ID, m.GetHeader("To"))
-			if err := gomail.Send(sender, m); err != nil {
+			fmt.Printf("[%d] Sending %s to %s\n", id, c.ID, m.GetToString())
+			if err := sender.Send(m); err != nil {
 				fmt.Printf("[%d] Could not send email: %s\n", id, err)
 				sender.Close() // Replace errored connection
 				sender, err = d.configureSender()
@@ -173,47 +180,35 @@ func (d *deliverer) startWorker(id int) error {
 	return nil
 }
 
-func (d *deliverer) configureSender() (sender gomail.SendCloser, err error) {
+func (d *deliverer) configureSender() (sender SendCloser, err error) {
 	cfg := d.campaign.Config
-	ctx := d.context
+	ctx := d.context // not used with go-mail
 
-	// Dial up SMTP or dryRun
+	// Skip dial on dryRun
 	if cfg.DryRun {
-		sender = &dryRunSender{Mails: [][]byte{}}
-	} else {
-
-		// Initialize dialer from configuration
-		dialer, err := smtpDialer(&cfg.SMTP)
-		if err != nil {
-			return nil, err
-		}
-
-		// Dial SMTP with 3 retries and failure logging
-		sender, err = backoff.Retry(ctx, dialer.Dial,
-			backoff.WithMaxTries(3),
-			backoff.WithBackOff(backoff.NewConstantBackOff(time.Second)),
-			backoff.WithNotify(func(err error, _ time.Duration) {
-				fmt.Println("Retrying SMTP dial on error: ", err)
-			}),
-		)
-		if err != nil {
-			return nil, err
-		}
+		return &dryRunSender{Mails: [][]byte{}}, nil
 	}
 
-	// DKIM-signing sender, if configuration is present
-	if dCfg := cfg.DKIM; len(dCfg) > 0 {
-		sender, err = SendCloserWithDKIM(cfg.AppFs, sender, dCfg)
-		if err != nil {
-			return nil, err
-		}
+	// Initialize dialer from configuration
+	dialer, err := smtpDialer(&cfg.SMTP)
+	if err != nil {
+		return nil, err
 	}
 
-	return sender, nil
+	// Dial SMTP with 3 retries and failure logging
+	return backoff.Retry(ctx, func() (*mail.Client, error) {
+		err := dialer.DialWithContext(ctx)
+		return dialer, err
+	},
+		backoff.WithMaxTries(3),
+		backoff.WithBackOff(backoff.NewConstantBackOff(time.Second)),
+		backoff.WithNotify(func(err error, _ time.Duration) {
+			fmt.Println("Retrying SMTP dial on error: ", err)
+		}),
+	)
 }
 
-func smtpDialer(cfg *config.SMTPConfig) (*gomail.Dialer, error) {
-	// Dial to SMTP server (with SSL)
+func smtpDialer(cfg *config.SMTPConfig) (*mail.Client, error) {
 	surl, err := url.Parse(cfg.URL)
 	if err != nil {
 		return nil, err
@@ -222,6 +217,7 @@ func smtpDialer(cfg *config.SMTPConfig) (*gomail.Dialer, error) {
 	}
 
 	// Populate/validate scheme
+	hostname := surl.Hostname()
 	if s := surl.Scheme; s == "" {
 		surl.Scheme = "smtps"
 	} else if s != "smtp" && s != "smtps" {
@@ -253,24 +249,41 @@ func smtpDialer(cfg *config.SMTPConfig) (*gomail.Dialer, error) {
 		port = 465
 	}
 
-	// Initialize the dialer
-	d := gomail.NewDialer(surl.Hostname(), port, user, pass)
-	d.SSL = (surl.Scheme == "smtps")
+	// Create client options
+	opts := []mail.Option{
+		mail.WithPort(port),
+	}
 
-	// Custom TLSConfig
+	// Add authentication if provided
+	if user != "" && pass != "" {
+		opts = append(opts, mail.WithSMTPAuth(mail.SMTPAuthPlain))
+		opts = append(opts, mail.WithUsername(user))
+		opts = append(opts, mail.WithPassword(pass))
+	}
+
+	// Configure TLS
+	if surl.Scheme == "smtps" {
+		opts = append(opts, mail.WithSSL())
+	} else {
+		opts = append(opts, mail.WithTLSPolicy(mail.TLSOpportunistic))
+	}
+
+	// Custom TLS config
 	if cfg.TLS != nil {
 		tlsMinVersion, err := cfg.TLS.GetMinVersion()
 		if err != nil {
 			return nil, err
 		}
-		d.TLSConfig = &tls.Config{
+		tlsConfig := &tls.Config{
 			InsecureSkipVerify: cfg.TLS.InsecureSkipVerify,
 			MinVersion:         tlsMinVersion,
-			ServerName:         d.Host,
+			ServerName:         hostname,
 		}
+		opts = append(opts, mail.WithTLSConfig(tlsConfig))
 	}
 
-	return d, nil
+	// Create the client with options
+	return mail.NewClient(hostname, opts...)
 }
 
 // Allow testing deliveries in libraries via dryRun
@@ -281,15 +294,21 @@ type dryRunSender struct {
 	Mails [][]byte
 }
 
-func (s *dryRunSender) Send(from string, to []string, msg io.WriterTo) error {
+func (s *dryRunSender) Send(msgs ...*mail.Msg) error {
 	s.lock.Lock()
 	defer s.lock.Unlock()
+	var err error
 
-	var buf bytes.Buffer
-	msg.WriteTo(&buf)
+	for _, msg := range msgs {
+		var buf bytes.Buffer
+		_, msgErr := msg.WriteTo(&buf)
+		err = errors.Join(err, msgErr)
+		if msgErr == nil {
+			s.Mails = append(s.Mails, buf.Bytes())
+		}
+	}
 
-	s.Mails = append(s.Mails, buf.Bytes())
-	return nil
+	return err
 }
 
 func (s *dryRunSender) Close() error {
