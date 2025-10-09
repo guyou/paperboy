@@ -26,7 +26,7 @@ type RecipientArg struct {
 func (r *Resolver) SendBeta(ctx context.Context, args SendOneArgs) (int32, error) {
 	// Some reflect voodoo is happening here with the nested array
 	if len(args.Recipients) == 0 {
-		return 0, fmt.Errorf("No recipients")
+		return 0, fmt.Errorf("no recipients")
 	}
 
 	// Request config with context
@@ -47,14 +47,23 @@ func (r *Resolver) SendBeta(ctx context.Context, args SendOneArgs) (int32, error
 	if err != nil {
 		return 0, err
 	} else if len(recipients) == 0 {
-		return 0, fmt.Errorf("No recipients")
+		return 0, fmt.Errorf("no recipients")
 	}
 
 	// Validate all recipients
 	for i, r := range recipients {
-		r.Email = args.Recipients[i].Email
-		if r.Email == "" {
-			return 0, fmt.Errorf("No email for recipient #%d", i)
+		rArgs := args.Recipients[i]
+
+		// Set email if provided in args
+		if e := rArgs.Email; e != "" {
+			(*r)["email"] = e
+		}
+		// Set name if provided in args
+		if n := rArgs.Name; n != nil && *n != "" {
+			(*r)["name"] = *n
+		}
+		if r.Email() == "" {
+			return 0, fmt.Errorf("no email for recipient #%d", i)
 		}
 	}
 

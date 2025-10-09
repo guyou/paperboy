@@ -13,12 +13,15 @@ func New(build config.BuildInfo) *cobra.Command {
 	config.Build = build
 
 	rootCmd := &cobra.Command{Use: "paperboy"}
+	rootCmd.CompletionOptions.HiddenDefaultCmd = true
+
 	rootCmd.AddCommand(newCmd())
 	rootCmd.AddCommand(initCmd())
 	rootCmd.AddCommand(sendCmd())
 	rootCmd.AddCommand(serverCmd())
 	rootCmd.AddCommand(versionCmd())
 	rootCmd.AddCommand(previewCmd())
+	rootCmd.AddCommand(verifyCmd())
 
 	var cfgFile string
 	rootCmd.PersistentFlags().StringVar(&cfgFile, "config", "", "config file (default: ./config.yaml)")
